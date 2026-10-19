@@ -1,0 +1,4 @@
+{"status":"ok"}
+{"status":"ready"}
+{"git_sha":"local","version":"dev"}
+uid=10001(appuser) gid=999(appuser) groups=999(appuser)

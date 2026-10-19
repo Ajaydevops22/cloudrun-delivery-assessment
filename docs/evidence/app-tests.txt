@@ -1,0 +1,11 @@
+============================= test session starts =============================
+platform win32 -- Python 3.12.10, pytest-8.3.4, pluggy-1.7.0 -- C:\Users\palem\Documents\cloudrun-delivery-assessment\app\.venv\Scripts\python.exe
+cachedir: .pytest_cache
+rootdir: C:\Users\palem\Documents\cloudrun-delivery-assessment\app
+collecting ... collected 3 items
+
+test_main.py::test_health PASSED                                         [ 33%]
+test_main.py::test_ready PASSED                                          [ 66%]
+test_main.py::test_version PASSED                                        [100%]
+
+============================== 3 passed in 0.30s ==============================
