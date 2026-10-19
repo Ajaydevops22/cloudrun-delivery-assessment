@@ -117,10 +117,11 @@ No cloud resources were created, so there is nothing to destroy.
 
 ## Time, assumptions, trade-offs, unfinished work
 
-- **Time spent:** about 2.5 hours (including installing local tools).
+- **Time spent:** about 4 hours in total, including about 1 hour installing local tools (Docker, WSL, Terraform, Trivy) (including installing local tools).
 - **Assumptions:** a live Google Cloud deployment is optional, so none was done. The service name `cloudrun-svc` and region `us-central1` are examples.
 - **Trade-offs:** mocked-provider tests prove module logic and guardrails, not real Google API behaviour. The 44 unfixed HIGH base-image findings are accepted and documented. The PR job gates Trivy on fixable findings only.
 - **Failure encountered:** a PowerShell loop passed `-chdir=terraform\envs\$e` unquoted, so `$e` was never expanded and Terraform reported "cannot find the file specified". Quoting the argument (`"-chdir=terraform\envs\$e"`) fixed it. Earlier, the first `curl` returned "Empty reply from server" because gunicorn had not finished starting; waiting a few seconds fixed it.
 - **Unfinished, next steps:** set up a real Google Cloud project with Workload Identity Federation and run plan and apply for dev; add Dependabot for actions and the base image; add canary traffic with automated rollback; add the kind or minikube extension; consider a distroless base image.
 - **AI assistance:** I used Claude (Anthropic) throughout to draft the Dockerfile, Terraform module and tests, workflows and documents, and to troubleshoot errors. I ran the commands, checked the outputs, and can explain and change everything in this repository.
+
 
