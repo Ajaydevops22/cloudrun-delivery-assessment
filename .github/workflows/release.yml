@@ -1,0 +1,214 @@
+name: release
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "**.md"
+
+# Least privilege by default; only jobs that need OIDC raise id-token.
+permissions:
+  contents: read
+
+env:
+  SERVICE_NAME: cloudrun-svc
+  REGION: ${{ vars.GCP_REGION || 'us-central1' }}
+
+jobs:
+  build:
+    name: Build once, identify by SHA and digest
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      image_ref: ${{ steps.ref.outputs.image_ref }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Build image (tagged with commit SHA)
+        run: |
+          docker build -t "${SERVICE_NAME}:${GITHUB_SHA}" \
+            --build-arg GIT_SHA="${GITHUB_SHA}" \
+            --build-arg APP_VERSION="${GITHUB_SHA::7}" .
+
+      # Keyless auth: GitHub OIDC token exchanged via Workload Identity Federation.
+      - name: Authenticate to Google Cloud (OIDC, no service-account keys)
+        id: auth
+        if: vars.GCP_ENABLED == 'true'
+        uses: google-github-actions/auth@71f986410dfbc7added4569d411d040a91dc6935 # v2.1.8
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_BUILD_SA }}
+          token_format: access_token
+
+      - name: Push to Artifact Registry and capture digest
+        id: push
+        if: vars.GCP_ENABLED == 'true'
+        env:
+          TOKEN: ${{ steps.auth.outputs.access_token }}
+          REGISTRY_PATH: ${{ env.REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ vars.GCP_AR_REPO }}/${{ env.SERVICE_NAME }}
+        run: |
+          echo "${TOKEN}" | docker login -u oauth2accesstoken --password-stdin "${REGION}-docker.pkg.dev"
+          docker tag "${SERVICE_NAME}:${GITHUB_SHA}" "${REGISTRY_PATH}:${GITHUB_SHA}"
+          docker push "${REGISTRY_PATH}:${GITHUB_SHA}"
+          DIGEST_REF=$(docker inspect --format='{{index .RepoDigests 0}}' "${REGISTRY_PATH}:${GITHUB_SHA}")
+          echo "digest_ref=${DIGEST_REF}" >> "${GITHUB_OUTPUT}"
+
+      - name: Resolve image reference (digest when pushed)
+        id: ref
+        env:
+          DIGEST_REF: ${{ steps.push.outputs.digest_ref }}
+        run: |
+          if [ -n "${DIGEST_REF}" ]; then
+            echo "image_ref=${DIGEST_REF}" >> "${GITHUB_OUTPUT}"
+          else
+            echo "image_ref=local/${SERVICE_NAME}:${GITHUB_SHA}" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Write release evidence
+        env:
+          IMAGE_REF: ${{ steps.ref.outputs.image_ref }}
+        run: |
+          mkdir -p evidence
+          IMAGE_ID=$(docker image inspect --format='{{.Id}}' "${SERVICE_NAME}:${GITHUB_SHA}")
+          printf '{"commit":"%s","image_ref":"%s","local_image_id":"%s","run_id":"%s"}\n' \
+            "${GITHUB_SHA}" "${IMAGE_REF}" "${IMAGE_ID}" "${GITHUB_RUN_ID}" > evidence/release.json
+          {
+            echo "### Release evidence"
+            echo "- Commit: ${GITHUB_SHA}"
+            echo "- Image reference: ${IMAGE_REF}"
+            echo "- Local image ID: ${IMAGE_ID}"
+            echo "- Built once; dev and prod both consume this same reference."
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
+        with:
+          name: release-evidence
+          path: evidence/release.json
+          retention-days: 30
+
+  plan:
+    name: Plan (${{ matrix.env }})
+    needs: build
+    if: vars.GCP_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: true
+      matrix:
+        env: [dev, prod]
+    env:
+      TF_VAR_project_id: ${{ vars.GCP_PROJECT_ID }}
+      TF_VAR_region: ${{ vars.GCP_REGION || 'us-central1' }}
+      TF_VAR_image: ${{ needs.build.outputs.image_ref }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Authenticate with the read-only plan identity
+        uses: google-github-actions/auth@71f986410dfbc7added4569d411d040a91dc6935 # v2.1.8
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_PLAN_SA }}
+
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
+        with:
+          terraform_version: "1.9.8"
+          terraform_wrapper: false
+
+      - name: Init (remote state in GCS)
+        run: terraform -chdir=terraform/envs/${{ matrix.env }} init -input=false -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}"
+
+      - name: Plan (saved, not applied)
+        run: terraform -chdir=terraform/envs/${{ matrix.env }} plan -input=false -lock-timeout=5m -out=tfplan
+
+      - name: Render plan for reviewers
+        run: |
+          terraform -chdir=terraform/envs/${{ matrix.env }} show -no-color tfplan > terraform/envs/${{ matrix.env }}/plan.txt
+          {
+            echo "### Terraform plan: ${{ matrix.env }}"
+            echo '```'
+            head -c 60000 terraform/envs/${{ matrix.env }}/plan.txt
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
+        with:
+          name: tfplan-${{ matrix.env }}
+          path: |
+            terraform/envs/${{ matrix.env }}/tfplan
+            terraform/envs/${{ matrix.env }}/plan.txt
+          retention-days: 14
+
+  apply-dev:
+    name: Apply dev (reviewed plan)
+    needs: [build, plan]
+    if: vars.GCP_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    environment: dev
+    concurrency:
+      group: deploy-dev
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Authenticate with the apply identity
+        uses: google-github-actions/auth@71f986410dfbc7added4569d411d040a91dc6935 # v2.1.8
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_APPLY_SA }}
+
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
+        with:
+          terraform_version: "1.9.8"
+          terraform_wrapper: false
+
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          name: tfplan-dev
+          path: terraform/envs/dev
+
+      - run: terraform -chdir=terraform/envs/dev init -input=false -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}"
+      - run: terraform -chdir=terraform/envs/dev apply -input=false tfplan
+
+  apply-prod:
+    name: Apply production (approval required)
+    needs: [plan, apply-dev]
+    if: vars.GCP_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    # The "production" environment has required reviewers: this is the approval boundary.
+    environment: production
+    # Only one production apply at a time; never cancel one that is running.
+    concurrency:
+      group: prod-deploy
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Authenticate with the apply identity
+        uses: google-github-actions/auth@71f986410dfbc7added4569d411d040a91dc6935 # v2.1.8
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_APPLY_SA }}
+
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
+        with:
+          terraform_version: "1.9.8"
+          terraform_wrapper: false
+
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          name: tfplan-prod
+          path: terraform/envs/prod
+
+      - run: terraform -chdir=terraform/envs/prod init -input=false -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}"
+      - run: terraform -chdir=terraform/envs/prod apply -input=false tfplan

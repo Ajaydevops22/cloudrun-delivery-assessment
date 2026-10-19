@@ -1,0 +1,47 @@
+name: rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      revision:
+        description: "Known-good Cloud Run revision name to send 100% of traffic to"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+# Shares the production lock so a rollback and a deploy never run together.
+concurrency:
+  group: prod-deploy
+  cancel-in-progress: false
+
+jobs:
+  rollback:
+    name: Shift production traffic to a previous revision
+    if: vars.GCP_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      REVISION: ${{ inputs.revision }}
+      REGION: ${{ vars.GCP_REGION || 'us-central1' }}
+    steps:
+      - name: Authenticate (OIDC, no keys)
+        uses: google-github-actions/auth@71f986410dfbc7added4569d411d040a91dc6935 # v2.1.8
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_APPLY_SA }}
+
+      - name: Record current traffic (evidence before change)
+        run: gcloud run services describe cloudrun-svc-prod --project "${{ vars.GCP_PROJECT_ID }}" --region "${REGION}" --format="yaml(status.traffic,status.latestReadyRevisionName)"
+
+      - name: Shift traffic
+        run: gcloud run services update-traffic cloudrun-svc-prod --project "${{ vars.GCP_PROJECT_ID }}" --region "${REGION}" --to-revisions "${REVISION}=100"
+
+      - name: Record traffic after change
+        run: |
+          gcloud run services describe cloudrun-svc-prod --project "${{ vars.GCP_PROJECT_ID }}" --region "${REGION}" --format="yaml(status.traffic)" | tee traffic-after.txt
+          { echo "### Rollback to ${REVISION}"; echo '```'; cat traffic-after.txt; echo '```'; } >> "${GITHUB_STEP_SUMMARY}"
