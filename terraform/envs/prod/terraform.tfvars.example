@@ -1,0 +1,2 @@
+project_id = "REPLACE_WITH_PROJECT_ID"
+image      = "REGION-docker.pkg.dev/PROJECT/REPO/cloudrun-svc@sha256:REPLACE_WITH_DIGEST"

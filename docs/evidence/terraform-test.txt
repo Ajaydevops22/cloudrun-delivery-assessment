@@ -1,0 +1,10 @@
+﻿tests\cloud_run.tftest.hcl... in progress
+  run "defaults_block_direct_internet_access"... pass
+  run "dedicated_service_account_per_environment"... pass
+  run "secrets_get_scoped_accessor_role_only"... pass
+  run "rejects_public_invoker"... pass
+  run "rejects_latest_image_tag"... pass
+tests\cloud_run.tftest.hcl... tearing down
+tests\cloud_run.tftest.hcl... pass
+
+Success! 5 passed, 0 failed.
