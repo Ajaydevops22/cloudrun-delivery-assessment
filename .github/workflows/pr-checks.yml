@@ -1,0 +1,76 @@
+name: pr-checks
+
+on:
+  pull_request:
+    branches: [main]
+
+# Least privilege: read-only token for every job in this workflow.
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  app:
+    name: App tests and lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.4.0
+        with:
+          python-version: "3.12"
+      - run: pip install -r app/requirements-dev.txt
+      - run: ruff check app
+      - run: pytest -v app
+
+  terraform:
+    name: Terraform fmt, validate, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
+        with:
+          terraform_version: "1.9.8"
+          terraform_wrapper: false
+      - run: terraform -chdir=terraform fmt -recursive -check
+      - name: Validate module and both environments
+        run: |
+          for dir in modules/cloud_run envs/dev envs/prod; do
+            terraform -chdir="terraform/$dir" init -backend=false -input=false
+            terraform -chdir="terraform/$dir" validate
+          done
+      - name: terraform test (mocked provider, no cloud credentials)
+        run: terraform -chdir=terraform/modules/cloud_run test
+
+  container:
+    name: Build image, smoke test, scan (no push)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Build (not pushed, not deployed)
+        run: docker build -t cloudrun-svc:pr --build-arg GIT_SHA="${{ github.sha }}" .
+      - name: Smoke test /health
+        run: |
+          docker run -d --name svc -p 8080:8080 cloudrun-svc:pr
+          for i in $(seq 1 15); do
+            curl -fsS http://localhost:8080/health && exit 0
+            sleep 2
+          done
+          docker logs svc
+          exit 1
+      - name: Trivy scan (fail on CRITICAL or fixable HIGH)
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy:0.76.0 image --no-progress \
+            --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 \
+            cloudrun-svc:pr | tee trivy-gate.txt
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "### Container checks"
+            echo "- Image built from commit ${{ github.sha }} (not pushed)"
+            echo "- Gate: fail on CRITICAL or fixable HIGH; unfixed findings are documented in docs/security-scan.md"
+          } >> "$GITHUB_STEP_SUMMARY"
